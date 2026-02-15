@@ -1,158 +1,307 @@
 #!/bin/bash
-# Confluence MCP 安装脚本
+# ============================================================
+# Confluence MCP 一键部署脚本
+# 用途：将 confluence-mcp 服务部署到用户本地并注册到 Claude Code
+# ============================================================
 
-echo "=================================="
-echo "Confluence MCP 安装向导"
-echo "=================================="
-echo ""
+set -euo pipefail
 
-# 检查 .env 文件
-if [ ! -f ".env" ]; then
-    echo "❌ 错误: 未找到 .env 文件"
-    echo "请先创建 .env 文件并配置以下变量："
-    echo "  CONFLUENCE_BASE_URL=https://confluence.example.com"
-    echo "  CONFLUENCE_API_TOKEN=your_token_here"
-    echo "  CONFLUENCE_DEFAULT_SPACE=~your_username"
-    exit 1
-fi
-
-# 读取环境变量
-source .env
-
-# 检查必需的环境变量
-if [ -z "$CONFLUENCE_API_TOKEN" ]; then
-    echo "❌ 错误: CONFLUENCE_API_TOKEN 未设置"
-    echo "请在 .env 文件中设置 CONFLUENCE_API_TOKEN"
-    exit 1
-fi
-
-echo "✅ 环境变量检查通过"
-echo ""
-
-# 检查 Python 包是否安装
-echo "检查 Python 包..."
-if ! python -c "import confluence_mcp" 2>/dev/null; then
-    echo "❌ confluence_mcp 未安装"
-    echo "正在安装..."
-    pip install -e .
-    if [ $? -ne 0 ]; then
-        echo "❌ 安装失败"
-        exit 1
-    fi
-fi
-echo "✅ Python 包已安装"
-echo ""
-
-# 检查 mermaid-cli（可选）
-echo "检查 mermaid-cli（可选）..."
-if command -v mmdc &> /dev/null; then
-    echo "✅ mermaid-cli 已安装"
-    MERMAID_AVAILABLE="true"
-else
-    echo "⚠️  mermaid-cli 未安装（可选）"
-    echo "   如需本地渲染 Mermaid 图表，请运行："
-    echo "   npm install -g @mermaid-js/mermaid-cli"
-    MERMAID_AVAILABLE="false"
-fi
-echo ""
-
-# 添加到 Claude Code
-echo "添加 Confluence MCP 到 Claude Code..."
-
-# 使用 claude mcp add 命令
-claude mcp remove confluence 2>/dev/null
-
-# 创建临时配置文件
-cat > /tmp/confluence_mcp.json << EOF
-{
-  "type": "stdio",
-  "command": "python",
-  "args": ["-m", "confluence_mcp.server"],
-  "env": {
-    "CONFLUENCE_BASE_URL": "${CONFLUENCE_BASE_URL}",
-    "CONFLUENCE_API_TOKEN": "${CONFLUENCE_API_TOKEN}",
-    "CONFLUENCE_DEFAULT_SPACE": "${CONFLUENCE_DEFAULT_SPACE:-~your_username}",
-    "LOG_LEVEL": "INFO"
-  }
-}
-EOF
-
-# 手动编辑 .claude.json
+# ---- 常量 ----
+REPO_URL="https://github.com/Coratch/mcp-server-confluence.git"
+INSTALL_DIR="$HOME/.local/share/confluence-mcp"
+VENV_DIR="$INSTALL_DIR/venv"
+CLONE_DIR="$INSTALL_DIR/source"
 CLAUDE_CONFIG="$HOME/.claude.json"
+MCP_SERVER_NAME="confluence"
+MIN_PYTHON_VERSION="3.10"
 
-if [ ! -f "$CLAUDE_CONFIG" ]; then
-    echo "❌ 错误: 未找到 Claude Code 配置文件"
-    echo "配置文件路径: $CLAUDE_CONFIG"
-    exit 1
-fi
+# ---- 颜色 ----
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
 
-# 使用 Python 更新配置
-python3 << 'PYTHON_SCRIPT'
-import json
-import os
+info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
 
-config_path = os.path.expanduser("~/.claude.json")
-temp_config_path = "/tmp/confluence_mcp.json"
+# ============================================================
+# 1. 前置检查
+# ============================================================
 
-# 读取现有配置
-with open(config_path, 'r') as f:
-    claude_config = json.load(f)
+check_python() {
+    local py_cmd=""
+    for cmd in python3 python; do
+        if command -v "$cmd" &>/dev/null; then
+            local ver
+            ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+            if [ -n "$ver" ] && python3 -c "
+import sys
+cur = tuple(map(int, '$ver'.split('.')))
+req = tuple(map(int, '$MIN_PYTHON_VERSION'.split('.')))
+sys.exit(0 if cur >= req else 1)
+" 2>/dev/null; then
+                py_cmd="$cmd"
+                break
+            fi
+        fi
+    done
 
-# 读取 Confluence MCP 配置
-with open(temp_config_path, 'r') as f:
-    confluence_config = json.load(f)
+    if [ -z "$py_cmd" ]; then
+        fail "需要 Python >= $MIN_PYTHON_VERSION，请先安装 Python"
+    fi
 
-# 更新配置
-if 'mcpServers' not in claude_config:
-    claude_config['mcpServers'] = {}
+    PYTHON_CMD="$py_cmd"
+    ok "Python: $($PYTHON_CMD --version)"
+}
 
-if 'servers' not in claude_config['mcpServers']:
-    claude_config['mcpServers']['servers'] = {}
+check_git() {
+    command -v git &>/dev/null || fail "需要 git，请先安装"
+    ok "Git: $(git --version | head -1)"
+}
 
-claude_config['mcpServers']['servers']['confluence'] = confluence_config
+# ============================================================
+# 2. 交互式收集 Confluence 配置
+# ============================================================
 
-# 保存配置
-with open(config_path, 'w') as f:
-    json.dump(claude_config, f, indent=2)
-
-print("✅ 配置已更新")
-PYTHON_SCRIPT
-
-if [ $? -ne 0 ]; then
-    echo "❌ 配置更新失败"
+collect_config() {
     echo ""
-    echo "请手动编辑 ~/.claude.json，在 mcpServers.servers 中添加："
-    cat /tmp/confluence_mcp.json
-    exit 1
-fi
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}  Confluence 连接配置${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo ""
 
-echo "✅ Confluence MCP 已添加到 Claude Code"
-echo ""
+    # Base URL
+    read -rp "Confluence 地址 [https://wiki.caijj.net]: " input_url
+    CONFLUENCE_BASE_URL="${input_url:-https://wiki.caijj.net}"
 
-# 测试连接
-echo "测试 MCP 服务器连接..."
-claude mcp list | grep confluence
+    # API Token
+    while true; do
+        read -rp "Personal Access Token (PAT): " CONFLUENCE_API_TOKEN
+        if [ -n "$CONFLUENCE_API_TOKEN" ]; then
+            break
+        fi
+        warn "Token 不能为空，请重新输入"
+    done
 
-echo ""
-echo "=================================="
-echo "✅ 安装完成！"
-echo "=================================="
-echo ""
-echo "功能说明："
-echo "  1. read_confluence_page - 读取页面"
-echo "  2. create_confluence_page - 创建页面"
-echo "  3. update_confluence_page - 更新页面"
-echo "  4. search_confluence_pages - 搜索页面"
-echo ""
-if [ "$MERMAID_AVAILABLE" = "true" ]; then
-    echo "✅ Mermaid 本地渲染: 已启用"
-else
-    echo "⚠️  Mermaid 本地渲染: 未启用（使用代码块方式）"
-fi
-echo ""
-echo "使用示例："
-echo "  在 Claude Code 中输入："
-echo "  '读取 Confluence 页面 416129733'"
-echo "  '创建一个 Confluence 页面...'"
-echo ""
-echo "详细文档: docs/MCP_FEATURES.md"
+    # Default Space
+    read -rp "默认空间 Key (可选，回车跳过): " CONFLUENCE_DEFAULT_SPACE
+
+    echo ""
+    info "配置确认："
+    echo "  URL:   $CONFLUENCE_BASE_URL"
+    echo "  Token: ${CONFLUENCE_API_TOKEN:0:8}********"
+    echo "  Space: ${CONFLUENCE_DEFAULT_SPACE:-（未设置）}"
+    echo ""
+    read -rp "确认以上配置？[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        info "已取消，请重新运行脚本"
+        exit 0
+    fi
+}
+
+# ============================================================
+# 3. 安装项目
+# ============================================================
+
+install_project() {
+    info "安装 confluence-mcp ..."
+
+    mkdir -p "$INSTALL_DIR"
+
+    # 创建 venv
+    if [ ! -d "$VENV_DIR" ]; then
+        info "创建虚拟环境 ..."
+        "$PYTHON_CMD" -m venv "$VENV_DIR"
+    fi
+
+    local pip_cmd="$VENV_DIR/bin/pip"
+    "$pip_cmd" install --upgrade pip -q 2>/dev/null
+
+    # 判断是否在项目目录内运行
+    if [ -f "./pyproject.toml" ] && grep -q 'name = "confluence-mcp"' ./pyproject.toml 2>/dev/null; then
+        info "检测到当前目录为项目源码，使用 editable 模式安装"
+        "$pip_cmd" install -e "$(pwd)" -q
+    else
+        # 克隆 → 安装 → 清理
+        info "克隆仓库 ..."
+        rm -rf "$CLONE_DIR"
+        git clone --depth 1 "$REPO_URL" "$CLONE_DIR"
+
+        info "安装依赖（首次可能较慢）..."
+        "$pip_cmd" install "$CLONE_DIR" -q
+
+        info "清理源码 ..."
+        rm -rf "$CLONE_DIR"
+        ok "源码已清理，仅保留 venv"
+    fi
+
+    ok "confluence-mcp 安装完成"
+}
+
+# ============================================================
+# 4. 注册到 Claude Code
+# ============================================================
+
+register_mcp() {
+    info "注册 MCP 服务到 Claude Code ..."
+
+    local venv_python="$VENV_DIR/bin/python"
+
+    # 构建 env JSON
+    local env_json
+    env_json=$(cat <<ENDJSON
+{
+    "CONFLUENCE_BASE_URL": "$CONFLUENCE_BASE_URL",
+    "CONFLUENCE_API_TOKEN": "$CONFLUENCE_API_TOKEN",
+    "CONFLUENCE_DEFAULT_SPACE": "${CONFLUENCE_DEFAULT_SPACE:-}",
+    "LOG_LEVEL": "INFO"
+}
+ENDJSON
+)
+
+    # 构建 MCP server 配置
+    local server_config
+    server_config=$(cat <<ENDJSON
+{
+    "type": "stdio",
+    "command": "$venv_python",
+    "args": ["-m", "confluence_mcp.server"],
+    "env": $env_json
+}
+ENDJSON
+)
+
+    # 更新 ~/.claude.json
+    "$venv_python" -c "
+import json, sys, os
+
+config_path = os.path.expanduser('$CLAUDE_CONFIG')
+server_name = '$MCP_SERVER_NAME'
+
+# 读取或初始化配置
+if os.path.exists(config_path):
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+else:
+    config = {}
+
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+# 清理旧的错误嵌套结构 (mcpServers.servers.confluence)
+if 'servers' in config['mcpServers']:
+    nested = config['mcpServers']['servers']
+    if isinstance(nested, dict) and server_name in nested:
+        del nested[server_name]
+    if not nested:
+        del config['mcpServers']['servers']
+
+# 写入正确位置: mcpServers.confluence
+server_config = json.loads('''$server_config''')
+config['mcpServers'][server_name] = server_config
+
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print('done')
+" || fail "写入 Claude Code 配置失败"
+
+    ok "MCP 服务已注册到 $CLAUDE_CONFIG"
+}
+
+# ============================================================
+# 5. 验证
+# ============================================================
+
+verify_install() {
+    info "验证安装 ..."
+
+    local venv_python="$VENV_DIR/bin/python"
+
+    # 验证模块可导入
+    "$venv_python" -c "from confluence_mcp.server import mcp; print('module ok')" 2>/dev/null \
+        || fail "模块导入失败，请检查安装"
+
+    ok "模块验证通过"
+
+    # 验证配置文件
+    "$venv_python" -c "
+import json, os
+with open(os.path.expanduser('$CLAUDE_CONFIG')) as f:
+    c = json.load(f)
+assert 'confluence' in c.get('mcpServers', {}), 'not found'
+print('config ok')
+" 2>/dev/null || fail "配置验证失败"
+
+    ok "配置验证通过"
+}
+
+# ============================================================
+# 6. 检查 mermaid-cli（可选）
+# ============================================================
+
+check_mermaid() {
+    if command -v mmdc &>/dev/null; then
+        ok "mermaid-cli 已安装，支持本地渲染 Mermaid 图表"
+    else
+        warn "mermaid-cli 未安装（可选），如需本地渲染 Mermaid 图表："
+        echo "    npm install -g @mermaid-js/mermaid-cli"
+    fi
+}
+
+# ============================================================
+# 主流程
+# ============================================================
+
+main() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║   Confluence MCP 一键部署            ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Step 1: 前置检查
+    info "检查环境 ..."
+    check_python
+    check_git
+
+    # Step 2: 收集配置
+    collect_config
+
+    # Step 3: 安装
+    install_project
+
+    # Step 4: 注册 MCP
+    register_mcp
+
+    # Step 5: 验证
+    verify_install
+
+    # Step 6: 可选组件
+    check_mermaid
+
+    # 完成
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   部署完成！                          ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
+    echo ""
+    echo "可用工具："
+    echo "  confluence_read_page    - 读取 Confluence 页面"
+    echo "  confluence_create_page  - 从 Markdown 创建页面"
+    echo "  confluence_update_page  - 更新页面内容"
+    echo "  confluence_search_pages - 搜索页面"
+    echo ""
+    echo "使用方式：重启 Claude Code 后直接对话即可"
+    echo "  示例：\"读取 Confluence 页面 416129733\""
+    echo ""
+    echo -e "安装路径：${CYAN}$INSTALL_DIR${NC}"
+    echo -e "虚拟环境：${CYAN}$VENV_DIR${NC}"
+    echo -e "配置文件：${CYAN}$CLAUDE_CONFIG${NC}"
+    echo ""
+}
+
+main "$@"

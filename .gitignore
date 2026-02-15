@@ -59,6 +59,3 @@ examples/output/
 
 # Serena IDE plugin
 .serena/
-
-# Coverage data
-.coverage
