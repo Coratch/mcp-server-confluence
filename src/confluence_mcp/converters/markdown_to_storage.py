@@ -6,7 +6,8 @@ import markdown
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..utils.logger import get_logger
-from .mermaid_to_image import MermaidToImageConverter
+from .drawio_handler import DrawioHandler
+from .mermaid_handler import MermaidHandler
 
 logger = get_logger(__name__)
 
@@ -28,24 +29,27 @@ class MarkdownToStorageConverter:
         )
 
     async def convert(
-        self, 
-        markdown_content: str, 
-        use_local_mermaid: bool = True,
+        self,
+        markdown_content: str,
+        mermaid_render_mode: str = "macro",
         page_id: Optional[str] = None,
-        confluence_client: Optional[Any] = None
+        confluence_client: Optional[Any] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """转换 Markdown 到 Storage Format
 
         Args:
             markdown_content: Markdown 内容
-            use_local_mermaid: 是否使用本地 Mermaid 渲染（需要 mmdc）
-            page_id: Confluence 页面 ID（用于上传附件）
-            confluence_client: Confluence API 客户端（用于上传附件）
+            mermaid_render_mode: Mermaid 渲染模式
+                - "macro": 使用 Confluence 原生 Mermaid 宏（需要 Mermaid 插件）
+                - "image": 使用本地 mermaid-cli 渲染为图片上传
+                - "code_block": 使用代码块 + Mermaid Live Editor 链接
+            page_id: Confluence 页面 ID（仅 image 模式需要，用于上传附件）
+            confluence_client: Confluence API 客户端（仅 image 模式需要）
 
         Returns:
             (Confluence Storage Format 内容, 附件信息列表)
         """
-        logger.info("开始转换 Markdown 到 Storage Format")
+        logger.info(f"开始转换 Markdown 到 Storage Format (mermaid_render_mode={mermaid_render_mode})")
         attachments = []
 
         # 1. 移除元数据头（如果存在）
@@ -53,78 +57,94 @@ class MarkdownToStorageConverter:
 
         # 2. 处理 Mermaid 代码块
         mermaid_placeholders = {}
-        
-        if use_local_mermaid and page_id and confluence_client:
-            # 尝试本地渲染
+
+        if mermaid_render_mode == "image" and page_id and confluence_client:
+            # 图片模式：使用本地 mermaid-cli 渲染
             from .mermaid_local_renderer import MermaidLocalRenderer
-            
+
             if MermaidLocalRenderer.check_mmdc_available():
                 logger.info("使用本地 mermaid-cli 渲染 Mermaid 图表")
-                
-                # 渲染所有 Mermaid 代码块为临时图片
+
                 temp_content, image_info = await MermaidLocalRenderer.render_all_to_temp(
                     markdown_content
                 )
-                
-                # 上传图片作为附件
+
                 for info in image_info:
                     try:
-                        # 上传附件
                         attachment = await confluence_client.upload_attachment(
                             page_id=page_id,
                             file_path=info["path"],
                             file_name=info["filename"],
-                            comment="Mermaid diagram rendered locally"
+                            comment="Mermaid diagram rendered locally",
                         )
-                        
-                        # 记录附件信息
                         attachments.append(attachment)
-                        
-                        # 准备 Confluence 图片标记
+
                         image_tag = (
                             f'<ac:image ac:align="center" ac:layout="center">'
                             f'<ri:attachment ri:filename="{info["filename"]}" />'
                             f'</ac:image>'
                         )
-                        
-                        # 记录占位符映射
                         placeholder = f"[[MERMAID_IMAGE_{info['index']}]]"
                         mermaid_placeholders[placeholder] = image_tag
-                        
                         logger.info(f"上传 Mermaid 图片成功: {info['filename']}")
-                        
+
                     except Exception as e:
                         logger.error(f"上传 Mermaid 图片失败: {e}")
-                        # 降级到代码块显示
                         placeholder = f"[[MERMAID_IMAGE_{info['index']}]]"
                         mermaid_placeholders[placeholder] = self._create_mermaid_code_block(info["code"])
-                
+
                 markdown_content = temp_content
-                
-                # 清理临时文件
+
                 import shutil
                 from pathlib import Path
                 if image_info:
                     temp_dir = Path(image_info[0]["path"]).parent
                     try:
                         shutil.rmtree(temp_dir)
-                    except:
+                    except Exception:
                         pass
             else:
-                logger.warning("mermaid-cli 不可用，使用代码块显示")
-                use_local_mermaid = False
-        
-        # 如果不使用本地渲染，使用代码块显示
-        if not use_local_mermaid or not mermaid_placeholders:
-            from .mermaid_handler import MermaidHandler
+                logger.warning("mermaid-cli 不可用，降级到 code_block 模式")
+                mermaid_render_mode = "code_block"
+        elif mermaid_render_mode == "image":
+            # image 模式但缺少 page_id 或 confluence_client，降级到 code_block
+            logger.warning("image 模式缺少 page_id 或 confluence_client，降级到 code_block 模式")
+            mermaid_render_mode = "code_block"
+
+        if mermaid_render_mode == "macro":
+            # 宏模式：使用 Confluence 原生 Mermaid 宏
             mermaid_blocks = MermaidHandler.extract_mermaid_blocks(markdown_content)
-            
+            for idx, (original, code) in enumerate(mermaid_blocks):
+                placeholder = f"MERMAIDBLOCK{idx}PLACEHOLDER"
+                confluence_macro = (
+                    '<ac:structured-macro ac:name="mermaid-macro" ac:schema-version="1">'
+                    '<ac:plain-text-body><![CDATA['
+                    f'{code}'
+                    ']]></ac:plain-text-body>'
+                    '</ac:structured-macro>'
+                )
+                mermaid_placeholders[placeholder] = confluence_macro
+                markdown_content = markdown_content.replace(original, placeholder)
+
+        elif mermaid_render_mode == "code_block":
+            # 代码块模式：可折叠代码块 + Mermaid Live Editor 链接
+            mermaid_blocks = MermaidHandler.extract_mermaid_blocks(markdown_content)
             for idx, (original, code) in enumerate(mermaid_blocks):
                 placeholder = f"MERMAIDBLOCK{idx}PLACEHOLDER"
                 mermaid_placeholders[placeholder] = self._create_mermaid_code_block(code)
                 markdown_content = markdown_content.replace(original, placeholder)
 
+        # 2.5 处理 draw.io 图表标记
+        drawio_placeholders = {}
+        drawio_blocks = DrawioHandler.extract_markdown_drawio(markdown_content)
+
+        for idx, (original, diagram_name) in enumerate(drawio_blocks):
+            placeholder = f"DRAWIOBLOCK{idx}PLACEHOLDER"
+            drawio_placeholders[placeholder] = DrawioHandler.markdown_to_drawio_macro(diagram_name)
+            markdown_content = markdown_content.replace(original, placeholder)
+
         # 3. 转换 Markdown 到 HTML
+        self.md.reset()
         html_content = self.md.convert(markdown_content)
 
         # 4. 替换 Mermaid 占位符
@@ -132,6 +152,11 @@ class MarkdownToStorageConverter:
             # 替换 <p> 包裹的占位符
             html_content = html_content.replace(f'<p>{placeholder}</p>', replacement)
             # 替换其他情况
+            html_content = html_content.replace(placeholder, replacement)
+
+        # 4.5 替换 draw.io 占位符
+        for placeholder, replacement in drawio_placeholders.items():
+            html_content = html_content.replace(f'<p>{placeholder}</p>', replacement)
             html_content = html_content.replace(placeholder, replacement)
 
         # 5. 转换 HTML 到 Confluence Storage Format
@@ -151,9 +176,10 @@ class MarkdownToStorageConverter:
         """
         import base64
         import zlib
-        
-        # 生成 Mermaid Live Editor 链接
-        compressed = zlib.compress(code.encode('utf-8'), level=9)
+
+        # 生成 Mermaid Live Editor 链接（使用 raw deflate 兼容 pako 格式）
+        compress_obj = zlib.compressobj(level=9, wbits=-15)
+        compressed = compress_obj.compress(code.encode('utf-8')) + compress_obj.flush()
         encoded = base64.urlsafe_b64encode(compressed).decode('utf-8')
         live_editor_url = f"https://mermaid.live/edit#pako:{encoded}"
 

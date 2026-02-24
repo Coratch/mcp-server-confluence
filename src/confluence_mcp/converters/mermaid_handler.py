@@ -16,9 +16,9 @@ class MermaidHandler:
         re.DOTALL | re.MULTILINE
     )
 
-    # Confluence Storage Format 中的 Mermaid 宏模式
+    # Confluence Storage Format 中的 Mermaid 宏模式（兼容 mermaid-macro 和 mermaid）
     CONFLUENCE_MERMAID_PATTERN = re.compile(
-        r'<ac:structured-macro\s+ac:name="mermaid"[^>]*>'
+        r'<ac:structured-macro\s+ac:name="mermaid(?:-macro)?"[^>]*>'
         r'.*?<ac:plain-text-body><!\[CDATA\[(.*?)\]\]></ac:plain-text-body>'
         r'.*?</ac:structured-macro>',
         re.DOTALL | re.MULTILINE
@@ -40,7 +40,7 @@ class MermaidHandler:
 
             # 构建 Confluence Mermaid 宏
             confluence_macro = (
-                '<ac:structured-macro ac:name="mermaid">'
+                '<ac:structured-macro ac:name="mermaid-macro" ac:schema-version="1">'
                 '<ac:plain-text-body><![CDATA['
                 f'{mermaid_code}'
                 ']]></ac:plain-text-body>'

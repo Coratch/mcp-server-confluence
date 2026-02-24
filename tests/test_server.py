@@ -90,7 +90,7 @@ def hello_world():
         space_key=os.getenv("CONFLUENCE_DEFAULT_SPACE", "TEST"),
         title="MCP 测试页面",
         markdown_content=markdown_content,
-        use_local_mermaid_render=True
+        mermaid_render_mode="macro"
     )
     
     try:
@@ -152,7 +152,7 @@ sequenceDiagram
         page_id=page_id,
         markdown_content=markdown_content,
         title="MCP 测试页面（已更新）",
-        use_local_mermaid_render=True
+        mermaid_render_mode="macro"
     )
     
     try:

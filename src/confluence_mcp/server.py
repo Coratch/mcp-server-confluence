@@ -1,7 +1,8 @@
 """Confluence MCP 服务器
 
 基于 Python + FastMCP 的 Confluence MCP 服务器，提供通过 MCP 协议访问 Confluence API 的能力。
-支持 Markdown 与 Confluence Storage Format 的双向转换，特别支持 Mermaid 图表的本地渲染。
+支持 Markdown 与 Confluence Storage Format 的双向转换，支持 Mermaid 图表的多种渲染模式
+（原生宏、本地图片渲染、代码块+在线编辑器）。
 
 服务器命名遵循 MCP 规范：confluence_mcp
 """
@@ -50,6 +51,14 @@ class ResponseFormat(str, Enum):
 
     MARKDOWN = "markdown"
     JSON = "json"
+
+
+class MermaidRenderMode(str, Enum):
+    """Mermaid 渲染模式枚举"""
+
+    MACRO = "macro"
+    IMAGE = "image"
+    CODE_BLOCK = "code_block"
 
 
 # ============== Pydantic 输入模型 ==============
@@ -101,11 +110,12 @@ class CreatePageInput(BaseModel):
     parent_id: Optional[str] = Field(
         default=None, description="父页面 ID（可选，用于创建子页面）", max_length=50
     )
-    use_local_mermaid_render: bool = Field(
-        default=True,
-        description="是否使用本地 Mermaid 渲染（需要安装 mermaid-cli）。"
-        "如果为 True 且 mermaid-cli 可用，将渲染为图片上传；"
-        "否则使用代码块 + 在线编辑器链接方式",
+    mermaid_render_mode: MermaidRenderMode = Field(
+        default=MermaidRenderMode.MACRO,
+        description="Mermaid 渲染模式："
+        "'macro'（默认）使用 Confluence 原生 Mermaid 宏直接渲染；"
+        "'image' 使用本地 mermaid-cli 渲染为图片上传；"
+        "'code_block' 使用可折叠代码块 + Mermaid Live Editor 链接",
     )
 
     @field_validator("space_key")
@@ -131,13 +141,12 @@ class UpdatePageInput(BaseModel):
         description="新标题（可选，不提供则保持原标题）",
         max_length=255,
     )
-    use_local_mermaid_render: bool = Field(
-        default=True,
-        description=(
-            "是否使用本地 Mermaid 渲染（需要 mermaid-cli）。"
-            "如果为 True 且 mermaid-cli 可用，将 Mermaid 代码渲染为图片并上传。"
-            "如果为 False 或 mermaid-cli 不可用，使用代码块方式。"
-        ),
+    mermaid_render_mode: MermaidRenderMode = Field(
+        default=MermaidRenderMode.MACRO,
+        description="Mermaid 渲染模式："
+        "'macro'（默认）使用 Confluence 原生 Mermaid 宏直接渲染；"
+        "'image' 使用本地 mermaid-cli 渲染为图片上传；"
+        "'code_block' 使用可折叠代码块 + Mermaid Live Editor 链接",
     )
 
 
@@ -335,13 +344,15 @@ async def confluence_create_page(params: CreatePageInput) -> str:
     此工具将 Markdown 内容转换为 Confluence Storage Format 并创建新页面。
     支持以下特性：
     - Markdown 语法转换（标题、列表、表格、代码块等）
-    - Mermaid 图表渲染（本地渲染为图片或使用在线编辑器链接）
+    - Mermaid 图表渲染（三种模式可选）
     - 创建子页面（通过 parent_id 参数）
 
     Mermaid 处理策略：
-    - use_local_mermaid_render=True（默认）：
-      如果 mermaid-cli 可用，将 Mermaid 代码渲染为 PNG 图片并上传为附件
-    - use_local_mermaid_render=False 或 mermaid-cli 不可用：
+    - mermaid_render_mode="macro"（默认）：
+      使用 Confluence 原生 Mermaid 宏直接渲染（需要 Mermaid 插件）
+    - mermaid_render_mode="image"：
+      使用本地 mermaid-cli 渲染为 PNG 图片并上传为附件
+    - mermaid_render_mode="code_block"：
       使用可折叠代码块 + Mermaid Live Editor 链接
 
     Args:
@@ -350,7 +361,7 @@ async def confluence_create_page(params: CreatePageInput) -> str:
             - title (str): 页面标题
             - markdown_content (str): Markdown 内容
             - parent_id (Optional[str]): 父页面 ID
-            - use_local_mermaid_render (bool): 是否本地渲染 Mermaid
+            - mermaid_render_mode (MermaidRenderMode): Mermaid 渲染模式
 
     Returns:
         str: JSON 格式的创建结果，包含：
@@ -384,56 +395,60 @@ async def confluence_create_page(params: CreatePageInput) -> str:
         # 检查是否有 Mermaid 代码块
         mermaid_blocks = MermaidHandler.extract_mermaid_blocks(params.markdown_content)
         has_mermaid = len(mermaid_blocks) > 0
+        render_mode = params.mermaid_render_mode.value
 
         async with ConfluenceClient() as client:
-            # 先创建页面（不包含 Mermaid 图片）
-            # 转换 Markdown 到 Storage Format（不使用本地渲染）
-            storage_content, _ = await md_to_storage.convert(
-                params.markdown_content,
-                use_local_mermaid=False
-            )
+            if render_mode == "image" and has_mermaid:
+                # image 模式需要先创建页面获取 page_id，再上传附件并更新
+                # 第一步：用 code_block 模式创建页面（占位）
+                storage_content, _ = await md_to_storage.convert(
+                    params.markdown_content,
+                    mermaid_render_mode="code_block",
+                )
 
-            # 创建页面
-            page = await client.create_page(
-                space_key=params.space_key,
-                title=params.title,
-                body_storage=storage_content,
-                parent_id=params.parent_id,
-            )
+                page = await client.create_page(
+                    space_key=params.space_key,
+                    title=params.title,
+                    body_storage=storage_content,
+                    parent_id=params.parent_id,
+                )
+                logger.info(f"页面创建成功（占位）: {page.id}")
 
-            logger.info(f"页面创建成功: {page.id}")
+                # 第二步：用 image 模式重新转换并更新
+                storage_with_images, attachments = await md_to_storage.convert(
+                    params.markdown_content,
+                    mermaid_render_mode="image",
+                    page_id=page.id,
+                    confluence_client=client,
+                )
 
-            # 如果需要本地渲染 Mermaid，重新转换并更新页面
-            mermaid_render_method = "code_block"
-            attachments_uploaded = 0
-            
-            if params.use_local_mermaid_render and has_mermaid:
-                from .converters.mermaid_local_renderer import MermaidLocalRenderer
-                
-                if MermaidLocalRenderer.check_mmdc_available():
-                    logger.info(f"使用本地渲染 {len(mermaid_blocks)} 个 Mermaid 图表")
-                    
-                    # 使用本地渲染重新转换
-                    storage_with_images, attachments = await md_to_storage.convert(
-                        params.markdown_content,
-                        use_local_mermaid=True,
+                attachments_uploaded = len(attachments) if attachments else 0
+                if attachments:
+                    page = await client.update_page(
                         page_id=page.id,
-                        confluence_client=client
+                        title=params.title,
+                        body_storage=storage_with_images,
+                        version_number=page.version.number,
                     )
-                    
-                    # 更新页面内容
-                    if attachments:
-                        page = await client.update_page(
-                            page_id=page.id,
-                            title=params.title,
-                            body_storage=storage_with_images,
-                            version_number=page.version.number
-                        )
-                        mermaid_render_method = "local_image"
-                        attachments_uploaded = len(attachments)
-                        logger.info(f"已上传 {attachments_uploaded} 个 Mermaid 图片")
+                    logger.info(f"已上传 {attachments_uploaded} 个 Mermaid 图片")
                 else:
-                    logger.info("mermaid-cli 不可用，使用代码块显示")
+                    # image 模式降级（mmdc 不可用），实际使用 code_block
+                    render_mode = "code_block"
+            else:
+                # macro 或 code_block 模式：直接转换并创建
+                storage_content, _ = await md_to_storage.convert(
+                    params.markdown_content,
+                    mermaid_render_mode=render_mode,
+                )
+                attachments_uploaded = 0
+
+                page = await client.create_page(
+                    space_key=params.space_key,
+                    title=params.title,
+                    body_storage=storage_content,
+                    parent_id=params.parent_id,
+                )
+                logger.info(f"页面创建成功: {page.id}")
 
             result = {
                 "id": page.id,
@@ -447,9 +462,9 @@ async def confluence_create_page(params: CreatePageInput) -> str:
                 ),
                 "status": "success",
                 "message": f"页面创建成功: {params.title}",
-                "mermaid_render_method": mermaid_render_method,
+                "mermaid_render_method": render_mode,
                 "mermaid_diagrams_count": len(mermaid_blocks) if has_mermaid else 0,
-                "mermaid_images_uploaded": attachments_uploaded,
+                "mermaid_images_uploaded": attachments_uploaded if render_mode == "image" else 0,
             }
 
             logger.info(f"页面创建完成: {page.id}")
@@ -483,7 +498,7 @@ async def confluence_update_page(params: UpdatePageInput) -> str:
             - page_id (str): 要更新的页面 ID
             - markdown_content (str): 新的 Markdown 内容
             - title (Optional[str]): 新标题（不提供则保持原标题）
-            - use_local_mermaid_render (bool): 是否本地渲染 Mermaid
+            - mermaid_render_mode (MermaidRenderMode): Mermaid 渲染模式
 
     Returns:
         str: JSON 格式的更新结果，包含：
@@ -520,31 +535,20 @@ async def confluence_update_page(params: UpdatePageInput) -> str:
             # 检查是否有 Mermaid 代码块
             mermaid_blocks = MermaidHandler.extract_mermaid_blocks(params.markdown_content)
             has_mermaid = len(mermaid_blocks) > 0
-
-            # 决定是否使用本地渲染
-            use_local_render = False
-            mermaid_render_method = "none"
-            attachments_uploaded = 0
-
-            if params.use_local_mermaid_render and has_mermaid:
-                from .converters.mermaid_local_renderer import MermaidLocalRenderer
-                if MermaidLocalRenderer.check_mmdc_available():
-                    use_local_render = True
-                    mermaid_render_method = "local_image"
-                else:
-                    mermaid_render_method = "code_block"
-            elif has_mermaid:
-                mermaid_render_method = "code_block"
+            render_mode = params.mermaid_render_mode.value
 
             # 转换 Markdown 到 Storage Format
             storage_content, attachments = await md_to_storage.convert(
                 params.markdown_content,
-                use_local_mermaid=use_local_render,
-                page_id=params.page_id if use_local_render else None,
-                confluence_client=client if use_local_render else None
+                mermaid_render_mode=render_mode,
+                page_id=params.page_id if render_mode == "image" else None,
+                confluence_client=client if render_mode == "image" else None,
             )
-            
+
             attachments_uploaded = len(attachments) if attachments else 0
+            # 如果 image 模式降级（mmdc 不可用），更新实际使用的模式
+            if render_mode == "image" and has_mermaid and attachments_uploaded == 0:
+                render_mode = "code_block"
 
             # 更新页面
             updated_page = await client.update_page(
@@ -573,9 +577,9 @@ async def confluence_update_page(params: UpdatePageInput) -> str:
                 "previous_version": (
                     current_page.version.number if current_page.version else 1
                 ),
-                "mermaid_render_method": mermaid_render_method,
+                "mermaid_render_method": render_mode,
                 "mermaid_diagrams_count": len(mermaid_blocks) if has_mermaid else 0,
-                "mermaid_images_uploaded": attachments_uploaded,
+                "mermaid_images_uploaded": attachments_uploaded if render_mode == "image" else 0,
             }
 
             logger.info(f"页面更新成功: {params.page_id}")
@@ -718,8 +722,12 @@ def main() -> None:
     """主入口函数"""
     logger.info("启动 Confluence MCP 服务器")
     logger.info(f"Confluence URL: {config.confluence_base_url}")
-    from .converters.mermaid_local_renderer import MermaidLocalRenderer
-    logger.info(f"Mermaid CLI 可用: {MermaidLocalRenderer.check_mmdc_available()}")
+    logger.info("默认 Mermaid 渲染模式: macro（Confluence 原生宏）")
+    try:
+        from .converters.mermaid_local_renderer import MermaidLocalRenderer
+        logger.info(f"Mermaid CLI 可用（image 模式）: {MermaidLocalRenderer.check_mmdc_available()}")
+    except ImportError:
+        logger.info("Mermaid CLI 不可用（image 模式不可用）")
 
     try:
         mcp.run()

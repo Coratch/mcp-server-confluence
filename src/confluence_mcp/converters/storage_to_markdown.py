@@ -6,6 +6,7 @@ import html2text
 from bs4 import BeautifulSoup
 
 from ..utils.logger import get_logger
+from .drawio_handler import DrawioHandler
 from .mermaid_handler import MermaidHandler
 
 logger = get_logger(__name__)
@@ -51,6 +52,16 @@ class StorageToMarkdownConverter:
             mermaid_placeholders[placeholder] = code
             storage_content = storage_content.replace(original, placeholder)
 
+        # 1.5 转换 draw.io 宏为临时占位符（避免被 html2text 处理）
+        drawio_blocks = DrawioHandler.extract_confluence_drawio(storage_content)
+        drawio_placeholders = {}
+
+        for idx, (original, params) in enumerate(drawio_blocks):
+            placeholder = f"___DRAWIO_BLOCK_{idx}___"
+            diagram_name = params.get('diagramName', params.get('attachment', 'diagram.drawio'))
+            drawio_placeholders[placeholder] = diagram_name
+            storage_content = storage_content.replace(original, placeholder)
+
         # 2. 处理其他 Confluence 宏，提取代码块
         storage_content, code_placeholders = self._process_confluence_macros(storage_content)
 
@@ -65,6 +76,13 @@ class StorageToMarkdownConverter:
             # 也尝试替换转义后的版本
             escaped_placeholder = placeholder.replace('_', r'\_')
             markdown_content = markdown_content.replace(escaped_placeholder, mermaid_block)
+
+        # 4.5 恢复 draw.io 图表（处理转义的占位符）
+        for placeholder, diagram_name in drawio_placeholders.items():
+            drawio_block = DrawioHandler.drawio_to_markdown(diagram_name)
+            markdown_content = markdown_content.replace(placeholder, drawio_block)
+            escaped_placeholder = placeholder.replace('_', r'\_')
+            markdown_content = markdown_content.replace(escaped_placeholder, drawio_block)
 
         # 5. 恢复代码块（处理转义的占位符）
         for placeholder, (language, code) in code_placeholders.items():
