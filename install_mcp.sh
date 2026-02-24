@@ -33,7 +33,7 @@ fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
 
 check_python() {
     local py_cmd=""
-    for cmd in python3 python; do
+    for cmd in python3.12 python3.11 python3.10 python3 python; do
         if command -v "$cmd" &>/dev/null; then
             local ver
             ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)

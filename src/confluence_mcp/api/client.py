@@ -48,12 +48,14 @@ class ConfluenceClient:
         self.max_retries = MAX_RETRIES
 
         # 创建 HTTP 客户端
+        # 注意：不在默认头中设置 Content-Type，因为上传附件时需要 multipart/form-data
+        # Content-Type 在 _request_with_retry 中按需设置
+        self._auth_headers = {
+            "Authorization": f"Bearer {self.config.confluence_api_token}",
+            "Accept": "application/json",
+        }
         self.client = httpx.AsyncClient(
-            headers={
-                "Authorization": f"Bearer {self.config.confluence_api_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=self._auth_headers,
             timeout=self.timeout,
         )
 
@@ -475,17 +477,19 @@ class ConfluenceClient:
                 data["comment"] = comment
 
             # 使用单独的请求，因为需要 multipart/form-data
+            # 添加 X-Atlassian-Token: nocheck 以禁用 XSRF 检查
             response = await self.client.post(
                 url,
                 files=files,
-                data=data
+                data=data,
+                headers={"X-Atlassian-Token": "nocheck"},
             )
 
         if response.status_code not in [200, 201]:
             self._handle_error(response)
 
         result = response.json()
-        
+
         # 处理返回数据（可能是单个对象或 results 数组）
         if "results" in result and result["results"]:
             attachment_info = result["results"][0]
@@ -497,7 +501,7 @@ class ConfluenceClient:
             f"(ID: {attachment_info.get('id')}, "
             f"大小: {attachment_info.get('extensions', {}).get('fileSize', 'N/A')} bytes)"
         )
-        
+
         return attachment_info
 
     async def upload_attachment_bytes(
@@ -547,7 +551,13 @@ class ConfluenceClient:
         if comment:
             data["comment"] = comment
 
-        response = await self.client.post(url, files=files, data=data)
+        # 添加 X-Atlassian-Token: nocheck 以禁用 XSRF 检查
+        response = await self.client.post(
+            url,
+            files=files,
+            data=data,
+            headers={"X-Atlassian-Token": "nocheck"},
+        )
 
         if response.status_code not in [200, 201]:
             self._handle_error(response)
