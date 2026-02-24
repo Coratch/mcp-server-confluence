@@ -182,3 +182,229 @@ class TestSearchScenarios:
 
         # 验证 API 仍然被正确调用
         mock_client.search_pages.assert_called_once()
+
+
+# ============== 读取场景测试 ==============
+
+
+class TestReadScenarios:
+    """读取页面场景端到端测试
+
+    验证 confluence_read_page 工具函数在各种页面内容场景下的行为，
+    包括代码块、表格、Mermaid 图表、Draw.io 图表、信息/警告宏、JSON 格式输出等。
+    使用真实 wiki 场景的 Storage Format 样本数据驱动测试。
+    """
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_with_code_blocks(self, MockClient):
+        """读取包含代码块的页面
+
+        验证 TECH_DESIGN_STORAGE 中的 Java 代码块能被正确转换为 Markdown 代码块，
+        包含语言标识（java）和代码内容（CreditScoreService 类）。
+        """
+        # 准备 mock 数据：使用技术设计文档的 Storage Format
+        page = make_page(
+            page_id="500001",
+            title="用户信用评分系统设计文档",
+            space_key="TECH",
+            storage_content=TECH_DESIGN_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        # 执行读取（通过 .fn 访问被 @mcp.tool 装饰器包装的原始异步函数）
+        params = ReadPageInput(page_id="500001")
+        result = await confluence_read_page.fn(params)
+
+        # 验证元数据头
+        assert "title: 用户信用评分系统设计文档" in result
+        assert "page_id: 500001" in result
+        assert "space: TECH" in result
+
+        # 验证 Java 代码块被正确转换
+        assert "```java" in result
+        assert "CreditScoreService" in result
+        assert "UserRepository" in result
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500001")
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_with_table(self, MockClient):
+        """读取包含表格的页面
+
+        验证 TECH_DESIGN_STORAGE 中的技术选型表格能被正确转换为 Markdown 表格，
+        包含 Spring Boot、MySQL、Redis 等技术栈信息。
+        """
+        page = make_page(
+            page_id="500002",
+            title="技术选型文档",
+            space_key="TECH",
+            storage_content=TECH_DESIGN_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        params = ReadPageInput(page_id="500002")
+        result = await confluence_read_page.fn(params)
+
+        # 验证表格内容中的关键技术栈
+        assert "Spring Boot" in result
+        assert "MySQL" in result
+        assert "Redis" in result
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500002")
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_with_mermaid(self, MockClient):
+        """读取包含 Mermaid 图表的页面
+
+        验证 TECH_DESIGN_STORAGE 中的 Mermaid 时序图宏能被正确转换为
+        Markdown Mermaid 代码块，包含 sequenceDiagram 关键字。
+        """
+        page = make_page(
+            page_id="500003",
+            title="核心流程文档",
+            space_key="TECH",
+            storage_content=TECH_DESIGN_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        params = ReadPageInput(page_id="500003")
+        result = await confluence_read_page.fn(params)
+
+        # 验证 Mermaid 代码块被正确转换
+        assert "```mermaid" in result
+        assert "sequenceDiagram" in result
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500003")
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_with_drawio(self, MockClient):
+        """读取包含 Draw.io 图表的页面
+
+        验证 DRAWIO_STORAGE 中的 draw.io 宏能被正确转换为 Markdown 格式，
+        包含 Draw.io 标识、图表文件名（system-architecture.drawio）和在线编辑器链接。
+        """
+        page = make_page(
+            page_id="500004",
+            title="系统架构图",
+            space_key="ARCH",
+            storage_content=DRAWIO_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        params = ReadPageInput(page_id="500004")
+        result = await confluence_read_page.fn(params)
+
+        # 验证 Draw.io 图表信息被正确转换
+        assert "Draw.io" in result
+        assert "system-architecture.drawio" in result
+        assert "app.diagrams.net" in result
+
+        # 验证元数据头
+        assert "title: 系统架构图" in result
+        assert "page_id: 500004" in result
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500004")
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_with_info_warning(self, MockClient):
+        """读取包含 info/warning 宏的页面
+
+        验证 TECH_DESIGN_STORAGE 中的 info 和 warning 宏内容文本在转换后被保留，
+        确保宏内的业务描述信息不会丢失。
+        """
+        page = make_page(
+            page_id="500005",
+            title="信用评分设计文档",
+            space_key="TECH",
+            storage_content=TECH_DESIGN_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        params = ReadPageInput(page_id="500005")
+        result = await confluence_read_page.fn(params)
+
+        # 验证 info 宏内容文本被保留
+        assert "本文档描述用户信用评分系统的技术设计方案" in result
+
+        # 验证 warning 宏内容文本被保留
+        assert "评分结果涉及用户隐私" in result
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500005")
+
+    @pytest.mark.asyncio
+    @patch("confluence_mcp.server.ConfluenceClient")
+    async def test_read_page_json_format(self, MockClient):
+        """读取页面并以 JSON 格式输出
+
+        验证 response_format=json 时返回结构化的 JSON 数据，
+        包含 metadata（title、page_id、space、version、url）、content 和 storage_format 字段，
+        且 JSON 内容可正确解析。
+        """
+        page = make_page(
+            page_id="500006",
+            title="JSON 格式测试页面",
+            space_key="DEV",
+            storage_content=TECH_DESIGN_STORAGE,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_page = AsyncMock(return_value=page)
+        MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        MockClient.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        params = ReadPageInput(
+            page_id="500006",
+            response_format=ResponseFormat.JSON,
+        )
+        result = await confluence_read_page.fn(params)
+
+        # 验证返回结果是可解析的 JSON
+        data = json.loads(result)
+
+        # 验证 metadata 结构（JSON 格式下 metadata 嵌套在顶层 metadata 字段中）
+        assert "metadata" in data
+        assert data["metadata"]["title"] == "JSON 格式测试页面"
+        assert data["metadata"]["page_id"] == "500006"
+        assert data["metadata"]["space"] == "DEV"
+        assert data["metadata"]["version"] == 1
+
+        # 验证 content 字段包含转换后的 Markdown
+        assert "content" in data
+        assert len(data["content"]) > 0
+
+        # 验证 storage_format 字段包含原始 Storage Format
+        assert "storage_format" in data
+        assert "<ac:structured-macro" in data["storage_format"]
+
+        # 验证 API 调用正确
+        mock_client.get_page.assert_called_once_with("500006")
