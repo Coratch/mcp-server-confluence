@@ -134,7 +134,7 @@ class MarkdownToStorageConverter:
                 mermaid_placeholders[placeholder] = self._create_mermaid_code_block(code)
                 markdown_content = markdown_content.replace(original, placeholder)
 
-        # 2.5 处理 draw.io 图表标记
+        # 2.5 处理 draw.io 图表引用标记（blockquote 格式）
         drawio_placeholders = {}
         drawio_blocks = DrawioHandler.extract_markdown_drawio(markdown_content)
 
@@ -142,6 +142,57 @@ class MarkdownToStorageConverter:
             placeholder = f"DRAWIOBLOCK{idx}PLACEHOLDER"
             drawio_placeholders[placeholder] = DrawioHandler.markdown_to_drawio_macro(diagram_name)
             markdown_content = markdown_content.replace(original, placeholder)
+
+        # 2.6 处理 draw.io XML 代码块（```drawio 格式）
+        drawio_codeblocks = DrawioHandler.extract_drawio_codeblocks(markdown_content)
+        drawio_codeblock_count = len(drawio_codeblocks)
+
+        if drawio_codeblocks and page_id and confluence_client:
+            for idx, (original, xml_content) in enumerate(drawio_codeblocks):
+                filename = DrawioHandler.generate_attachment_filename(idx)
+                placeholder = f"DRAWIOCODEBLOCK{idx}PLACEHOLDER"
+
+                try:
+                    # 上传 draw.io XML 为附件
+                    attachment = await confluence_client.upload_attachment_bytes(
+                        page_id=page_id,
+                        content=xml_content.encode("utf-8"),
+                        file_name=filename,
+                        content_type="application/vnd.jgraph.mxfile",
+                        comment="Draw.io diagram uploaded via MCP",
+                    )
+                    attachments.append(attachment)
+
+                    # 生成 draw.io 宏引用附件
+                    drawio_placeholders[placeholder] = DrawioHandler.markdown_to_drawio_macro(filename)
+                    logger.info(f"上传 draw.io 附件成功: {filename}")
+
+                except Exception as e:
+                    logger.error(f"上传 draw.io 附件失败: {e}")
+                    # 降级：保留为代码块
+                    drawio_placeholders[placeholder] = (
+                        '<ac:structured-macro ac:name="code">'
+                        '<ac:parameter ac:name="language">xml</ac:parameter>'
+                        '<ac:parameter ac:name="title">Draw.io Diagram XML</ac:parameter>'
+                        f'<ac:plain-text-body><![CDATA[{xml_content}]]></ac:plain-text-body>'
+                        '</ac:structured-macro>'
+                    )
+
+                markdown_content = markdown_content.replace(original, placeholder)
+
+        elif drawio_codeblocks:
+            # 缺少 page_id 或 confluence_client，用代码块占位
+            logger.warning("draw.io 代码块需要 page_id 和 confluence_client 才能上传附件")
+            for idx, (original, xml_content) in enumerate(drawio_codeblocks):
+                placeholder = f"DRAWIOCODEBLOCK{idx}PLACEHOLDER"
+                drawio_placeholders[placeholder] = (
+                    '<ac:structured-macro ac:name="code">'
+                    '<ac:parameter ac:name="language">xml</ac:parameter>'
+                    '<ac:parameter ac:name="title">Draw.io Diagram XML</ac:parameter>'
+                    f'<ac:plain-text-body><![CDATA[{xml_content}]]></ac:plain-text-body>'
+                    '</ac:structured-macro>'
+                )
+                markdown_content = markdown_content.replace(original, placeholder)
 
         # 3. 转换 Markdown 到 HTML
         self.md.reset()
@@ -303,6 +354,10 @@ class MarkdownToStorageConverter:
 
                 # 跳过 Mermaid 占位符（这些会在后面单独处理）
                 if code_content.strip().startswith('MERMAIDBLOCK') and code_content.strip().endswith('PLACEHOLDER'):
+                    continue
+
+                # 跳过 draw.io 代码块占位符
+                if code_content.strip().startswith('DRAWIOCODEBLOCK') and code_content.strip().endswith('PLACEHOLDER'):
                     continue
 
                 # 提取语言（如果有）

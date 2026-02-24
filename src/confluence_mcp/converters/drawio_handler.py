@@ -34,10 +34,16 @@ class DrawioHandler:
         re.DOTALL
     )
 
-    # Markdown 中的 draw.io 标记模式（用于反向转换）
+    # Markdown 中的 draw.io 标记模式（用于反向转换，引用格式）
     MD_DRAWIO_PATTERN = re.compile(
         r'> ?\U0001f4ca ?\*\*Draw\.io (?:图表|Diagram)\*\*[：:]\s*(.+?)$',
         re.MULTILINE
+    )
+
+    # Markdown 中的 draw.io 代码块模式（```drawio ... ```）
+    MD_DRAWIO_CODEBLOCK_PATTERN = re.compile(
+        r'```drawio\s*\n(.*?)\n```',
+        re.DOTALL | re.MULTILINE
     )
 
     @classmethod
@@ -118,7 +124,7 @@ class DrawioHandler:
 
     @classmethod
     def extract_markdown_drawio(cls, markdown_content: str) -> List[Tuple[str, str]]:
-        """从 Markdown 中提取所有 draw.io 图表标记
+        """从 Markdown 中提取所有 draw.io 图表引用标记（blockquote 格式）
 
         Args:
             markdown_content: Markdown 内容
@@ -144,3 +150,35 @@ class DrawioHandler:
             results.append((full_match, diagram_name))
 
         return results
+
+    @classmethod
+    def extract_drawio_codeblocks(cls, markdown_content: str) -> List[Tuple[str, str]]:
+        """从 Markdown 中提取所有 draw.io XML 代码块（```drawio 格式）
+
+        Args:
+            markdown_content: Markdown 内容
+
+        Returns:
+            (原始代码块文本, XML 内容) 的列表
+        """
+        results = []
+        for match in cls.MD_DRAWIO_CODEBLOCK_PATTERN.finditer(markdown_content):
+            full_match = match.group(0)
+            xml_content = match.group(1).strip()
+
+            logger.debug(f"提取到 draw.io XML 代码块 ({len(xml_content)} bytes)")
+            results.append((full_match, xml_content))
+
+        return results
+
+    @staticmethod
+    def generate_attachment_filename(index: int) -> str:
+        """生成 draw.io 附件文件名
+
+        Args:
+            index: 图表索引（从 0 开始）
+
+        Returns:
+            文件名，如 'drawio_diagram_0.drawio'
+        """
+        return f"drawio_diagram_{index}.drawio"

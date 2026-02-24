@@ -19,6 +19,7 @@ from .api.client import ConfluenceClient
 from .config import get_config
 from .converters.markdown_to_storage import MarkdownToStorageConverter
 from .converters.mermaid_handler import MermaidHandler
+from .converters.drawio_handler import DrawioHandler
 
 from .converters.storage_to_markdown import StorageToMarkdownConverter
 from .utils.exceptions import (
@@ -397,13 +398,21 @@ async def confluence_create_page(params: CreatePageInput) -> str:
         has_mermaid = len(mermaid_blocks) > 0
         render_mode = params.mermaid_render_mode.value
 
+        # 检查是否有 draw.io XML 代码块
+        drawio_codeblocks = DrawioHandler.extract_drawio_codeblocks(params.markdown_content)
+        has_drawio_codeblocks = len(drawio_codeblocks) > 0
+
+        # 判断是否需要两步创建流程（需要先获取 page_id 才能上传附件）
+        needs_two_step = (render_mode == "image" and has_mermaid) or has_drawio_codeblocks
+
         async with ConfluenceClient() as client:
-            if render_mode == "image" and has_mermaid:
-                # image 模式需要先创建页面获取 page_id，再上传附件并更新
-                # 第一步：用 code_block 模式创建页面（占位）
+            if needs_two_step:
+                # 两步创建：先创建占位页面，再上传附件并更新
+                # 第一步：用简化模式创建页面（不上传附件）
+                first_pass_mermaid_mode = "code_block" if (render_mode == "image" and has_mermaid) else render_mode
                 storage_content, _ = await md_to_storage.convert(
                     params.markdown_content,
-                    mermaid_render_mode="code_block",
+                    mermaid_render_mode=first_pass_mermaid_mode,
                 )
 
                 page = await client.create_page(
@@ -414,10 +423,10 @@ async def confluence_create_page(params: CreatePageInput) -> str:
                 )
                 logger.info(f"页面创建成功（占位）: {page.id}")
 
-                # 第二步：用 image 模式重新转换并更新
-                storage_with_images, attachments = await md_to_storage.convert(
+                # 第二步：用完整模式重新转换并更新（传入 page_id 和 client 以支持附件上传）
+                storage_with_attachments, attachments = await md_to_storage.convert(
                     params.markdown_content,
-                    mermaid_render_mode="image",
+                    mermaid_render_mode=render_mode,
                     page_id=page.id,
                     confluence_client=client,
                 )
@@ -427,15 +436,16 @@ async def confluence_create_page(params: CreatePageInput) -> str:
                     page = await client.update_page(
                         page_id=page.id,
                         title=params.title,
-                        body_storage=storage_with_images,
+                        body_storage=storage_with_attachments,
                         version_number=page.version.number,
                     )
-                    logger.info(f"已上传 {attachments_uploaded} 个 Mermaid 图片")
+                    logger.info(f"已上传 {attachments_uploaded} 个附件（Mermaid + draw.io）")
                 else:
-                    # image 模式降级（mmdc 不可用），实际使用 code_block
-                    render_mode = "code_block"
+                    # 附件上传全部失败或降级，实际使用的可能是 code_block
+                    if render_mode == "image" and has_mermaid:
+                        render_mode = "code_block"
             else:
-                # macro 或 code_block 模式：直接转换并创建
+                # 单步创建：直接转换并创建（无需附件上传）
                 storage_content, _ = await md_to_storage.convert(
                     params.markdown_content,
                     mermaid_render_mode=render_mode,
@@ -465,6 +475,7 @@ async def confluence_create_page(params: CreatePageInput) -> str:
                 "mermaid_render_method": render_mode,
                 "mermaid_diagrams_count": len(mermaid_blocks) if has_mermaid else 0,
                 "mermaid_images_uploaded": attachments_uploaded if render_mode == "image" else 0,
+                "drawio_diagrams_count": len(drawio_codeblocks) if has_drawio_codeblocks else 0,
             }
 
             logger.info(f"页面创建完成: {page.id}")
@@ -537,12 +548,17 @@ async def confluence_update_page(params: UpdatePageInput) -> str:
             has_mermaid = len(mermaid_blocks) > 0
             render_mode = params.mermaid_render_mode.value
 
+            # 检查是否有 draw.io XML 代码块
+            drawio_codeblocks = DrawioHandler.extract_drawio_codeblocks(params.markdown_content)
+            has_drawio_codeblocks = len(drawio_codeblocks) > 0
+
             # 转换 Markdown 到 Storage Format
+            # 始终传入 page_id 和 client，以支持 draw.io 代码块上传和 Mermaid image 模式
             storage_content, attachments = await md_to_storage.convert(
                 params.markdown_content,
                 mermaid_render_mode=render_mode,
-                page_id=params.page_id if render_mode == "image" else None,
-                confluence_client=client if render_mode == "image" else None,
+                page_id=params.page_id,
+                confluence_client=client,
             )
 
             attachments_uploaded = len(attachments) if attachments else 0
@@ -580,6 +596,7 @@ async def confluence_update_page(params: UpdatePageInput) -> str:
                 "mermaid_render_method": render_mode,
                 "mermaid_diagrams_count": len(mermaid_blocks) if has_mermaid else 0,
                 "mermaid_images_uploaded": attachments_uploaded if render_mode == "image" else 0,
+                "drawio_diagrams_count": len(drawio_codeblocks) if has_drawio_codeblocks else 0,
             }
 
             logger.info(f"页面更新成功: {params.page_id}")

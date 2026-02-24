@@ -500,6 +500,70 @@ class ConfluenceClient:
         
         return attachment_info
 
+    async def upload_attachment_bytes(
+        self,
+        page_id: str,
+        content: bytes,
+        file_name: str,
+        content_type: str = "application/octet-stream",
+        comment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """从内存字节上传附件到页面
+
+        Args:
+            page_id: 页面 ID
+            content: 文件内容字节
+            file_name: 附件名称
+            content_type: MIME 类型
+            comment: 附件注释（可选）
+
+        Returns:
+            附件信息字典
+
+        Raises:
+            NotFoundError: 页面不存在
+            PermissionError: 无权限上传附件
+            APIError: 其他 API 错误
+        """
+        url = f"{self.base_url}/content/{page_id}/child/attachment"
+
+        # 先检查是否已存在同名附件
+        check_url = f"{url}?filename={file_name}"
+        logger.info(f"检查附件是否存在: {file_name}")
+
+        try:
+            check_response = await self._request_with_retry("GET", check_url)
+            if check_response.status_code == 200:
+                data = check_response.json()
+                if data.get("size", 0) > 0:
+                    existing_id = data["results"][0]["id"]
+                    url = f"{self.base_url}/content/{page_id}/child/attachment/{existing_id}/data"
+                    logger.info(f"更新现有附件: {file_name} (ID: {existing_id})")
+        except Exception as e:
+            logger.debug(f"检查附件时出错（可能是新附件）: {e}")
+
+        files = {"file": (file_name, content, content_type)}
+        data = {}
+        if comment:
+            data["comment"] = comment
+
+        response = await self.client.post(url, files=files, data=data)
+
+        if response.status_code not in [200, 201]:
+            self._handle_error(response)
+
+        result = response.json()
+        if "results" in result and result["results"]:
+            attachment_info = result["results"][0]
+        else:
+            attachment_info = result
+
+        logger.info(
+            f"附件上传成功: {file_name} "
+            f"(ID: {attachment_info.get('id')}, 大小: {len(content)} bytes)"
+        )
+        return attachment_info
+
     async def get_attachments(
         self,
         page_id: str,
