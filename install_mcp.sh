@@ -322,8 +322,8 @@ collect_config() {
     echo ""
 
     # Base URL
-    read -rp "Confluence 地址 [https://wiki.caijj.net]: " input_url
-    CONFLUENCE_BASE_URL="${input_url:-https://wiki.caijj.net}"
+    read -rp "Confluence 地址 [https://wiki.example.net]: " input_url
+    CONFLUENCE_BASE_URL="${input_url:-https://wiki.example.net}"
 
     # 验证 URL 格式
     if [[ ! "$CONFLUENCE_BASE_URL" =~ ^https?:// ]]; then
