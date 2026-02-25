@@ -6,6 +6,7 @@
 
 服务器命名遵循 MCP 规范：confluence_mcp
 """
+import html
 import json
 import os
 import re
@@ -256,6 +257,90 @@ class UploadDrawioInput(BaseModel):
             raise ValueError("file_name 必须以 .drawio 结尾")
         if any(c in v for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']):
             raise ValueError("file_name 包含非法字符")
+        return v
+
+
+class ContentFormat(str, Enum):
+    """评论内容格式枚举"""
+
+    MARKDOWN = "markdown"
+    PLAIN_TEXT = "plain_text"
+
+
+class GetCommentsInput(BaseModel):
+    """获取页面评论的输入参数"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    page_id: str = Field(
+        ...,
+        description="Confluence 页面 ID（例如：'123456'）",
+        min_length=1,
+        max_length=50,
+    )
+    limit: int = Field(
+        default=50,
+        description="返回评论数量限制",
+        ge=1,
+        le=100,
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="输出格式：'markdown'（人类可读）或 'json'（机器处理）",
+    )
+
+    @field_validator("page_id")
+    @classmethod
+    def validate_page_id(cls, v: str) -> str:
+        """验证页面 ID"""
+        if not v.strip():
+            raise ValueError("page_id 不能为空")
+        return v.strip()
+
+
+class AddCommentInput(BaseModel):
+    """发布评论的输入参数"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    page_id: str = Field(
+        ...,
+        description="Confluence 页面 ID（例如：'123456'）",
+        min_length=1,
+        max_length=50,
+    )
+    content: str = Field(
+        ...,
+        description="评论内容",
+        min_length=1,
+    )
+    content_format: ContentFormat = Field(
+        default=ContentFormat.PLAIN_TEXT,
+        description=(
+            "评论内容格式：'plain_text'（默认）纯文本，自动包裹 HTML 标签；"
+            "'markdown' 将 Markdown 转换为 Confluence Storage Format"
+        ),
+    )
+    parent_comment_id: Optional[str] = Field(
+        default=None,
+        description="父评论 ID（可选，用于回复已有评论）",
+        max_length=50,
+    )
+
+    @field_validator("page_id")
+    @classmethod
+    def validate_page_id(cls, v: str) -> str:
+        """验证页面 ID"""
+        if not v.strip():
+            raise ValueError("page_id 不能为空")
+        return v.strip()
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, v: str) -> str:
+        """验证评论内容"""
+        if not v.strip():
+            raise ValueError("评论内容不能为空")
         return v
 
 
@@ -804,6 +889,255 @@ async def confluence_search_pages(params: SearchPagesInput) -> str:
 
     except Exception as e:
         logger.error(f"搜索失败: {e}", exc_info=True)
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="confluence_get_comments",
+    annotations={
+        "title": "获取 Confluence 页面评论",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def confluence_get_comments(params: GetCommentsInput) -> str:
+    """获取 Confluence 页面的评论列表。
+
+    此工具从 Confluence 获取指定页面的所有评论（包括嵌套回复），
+    并将评论内容从 Storage Format 转换为易读的 Markdown 格式。
+
+    支持以下特性：
+    - 获取页面级评论（footer comments）
+    - 包含所有嵌套回复（depth=all）
+    - 评论内容自动转换为 Markdown
+    - 包含评论者、时间、解决状态等元数据
+
+    Args:
+        params (GetCommentsInput): 包含以下字段：
+            - page_id (str): Confluence 页面 ID（例如：'123456'）
+            - limit (int): 返回评论数量限制（1-100，默认50）
+            - response_format (ResponseFormat): 输出格式，'markdown' 或 'json'
+
+    Returns:
+        str: 根据 response_format 返回：
+            - markdown: 格式化的评论列表
+            - json: 包含完整评论数据的 JSON 字符串
+
+    Examples:
+        - 获取评论: params = {"page_id": "123456"}
+        - JSON 格式: params = {"page_id": "123456", "response_format": "json"}
+        - 限制数量: params = {"page_id": "123456", "limit": 10}
+
+    Error Handling:
+        - 页面不存在: 返回 NotFoundError 相关提示
+        - 权限不足: 返回 PermissionError 相关提示
+        - 认证失败: 返回 AuthenticationError 相关提示
+    """
+    logger.info(f"获取页面评论: {params.page_id}")
+
+    try:
+        async with ConfluenceClient() as client:
+            data = await client.get_comments(
+                page_id=params.page_id,
+                depth="all",
+                limit=params.limit,
+            )
+
+            comments_raw = data.get("results", [])
+
+            # 解析评论数据
+            comments = []
+            for comment in comments_raw:
+                body_storage = ""
+                if comment.get("body", {}).get("storage"):
+                    body_storage = comment["body"]["storage"].get("value", "")
+
+                # 将 Storage Format 转为 Markdown
+                body_markdown = storage_to_md.convert(body_storage) if body_storage else ""
+
+                # 提取评论者信息
+                version_info = comment.get("version", {})
+                author = version_info.get("by", {})
+                author_name = author.get("displayName", author.get("username", "未知"))
+                created_at = version_info.get("when", "")
+
+                # 提取解决状态
+                extensions = comment.get("extensions", {})
+                resolution = extensions.get("resolution", {})
+                resolution_status = resolution.get("status", "")
+
+                # 判断是否为回复（有 ancestors）
+                ancestors = comment.get("ancestors", [])
+                parent_id = ancestors[-1]["id"] if ancestors else None
+
+                comment_data = {
+                    "id": comment.get("id", ""),
+                    "author": author_name,
+                    "created_at": created_at,
+                    "body_markdown": body_markdown.strip(),
+                    "body_storage": body_storage,
+                    "resolution_status": resolution_status,
+                    "parent_comment_id": parent_id,
+                }
+                comments.append(comment_data)
+
+            if params.response_format == ResponseFormat.JSON:
+                response = {
+                    "page_id": params.page_id,
+                    "total": len(comments),
+                    "comments": comments,
+                }
+                return json.dumps(response, ensure_ascii=False, indent=2)
+            else:
+                lines = [
+                    f"# 页面评论 (page_id: {params.page_id})",
+                    "",
+                    f"共 **{len(comments)}** 条评论",
+                    "",
+                ]
+
+                if not comments:
+                    lines.append("暂无评论。")
+                else:
+                    top_level_idx = 0
+                    for c in comments:
+                        if c["parent_comment_id"]:
+                            prefix = "  ↳ 回复"
+                        else:
+                            top_level_idx += 1
+                            prefix = f"## {top_level_idx}."
+                        lines.append(
+                            f"{prefix} **{c['author']}** (ID: {c['id']})"
+                        )
+                        if c["created_at"]:
+                            lines.append(f"- **时间**: {c['created_at']}")
+                        if c["resolution_status"]:
+                            lines.append(f"- **状态**: {c['resolution_status']}")
+                        if c["parent_comment_id"]:
+                            lines.append(
+                                f"- **回复评论**: {c['parent_comment_id']}"
+                            )
+                        lines.append(f"- **内容**:")
+                        lines.append("")
+                        lines.append(c["body_markdown"])
+                        lines.append("")
+
+                logger.info(f"获取到 {len(comments)} 条评论")
+                return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"获取评论失败: {e}", exc_info=True)
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="confluence_add_comment",
+    annotations={
+        "title": "发布 Confluence 页面评论",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def confluence_add_comment(params: AddCommentInput) -> str:
+    """在 Confluence 页面上发布评论。
+
+    此工具在指定页面上创建新评论，支持纯文本和 Markdown 两种内容格式，
+    并支持回复已有评论（嵌套评论）。
+
+    内容格式：
+    - content_format="plain_text"（默认）：纯文本，自动包裹 HTML 标签
+    - content_format="markdown"：将 Markdown 转换为 Confluence Storage Format
+
+    Args:
+        params (AddCommentInput): 包含以下字段：
+            - page_id (str): Confluence 页面 ID
+            - content (str): 评论内容
+            - content_format (ContentFormat): 内容格式（'plain_text' 或 'markdown'）
+            - parent_comment_id (Optional[str]): 父评论 ID（用于回复评论）
+
+    Returns:
+        str: JSON 格式的创建结果，包含：
+            - status: 操作状态
+            - comment_id: 新评论 ID
+            - page_id: 页面 ID
+            - author: 评论者
+            - content_format: 使用的内容格式
+            - message: 操作消息
+
+    Examples:
+        - 发布纯文本评论:
+          params = {
+              "page_id": "123456",
+              "content": "这是一条评论"
+          }
+        - 发布 Markdown 评论:
+          params = {
+              "page_id": "123456",
+              "content": "**重要**: 请查看 `config.yaml` 的修改",
+              "content_format": "markdown"
+          }
+        - 回复评论:
+          params = {
+              "page_id": "123456",
+              "content": "同意这个方案",
+              "parent_comment_id": "67890"
+          }
+
+    Error Handling:
+        - 页面不存在: 返回 NotFoundError 相关提示
+        - 权限不足: 返回 PermissionError 相关提示
+        - 认证失败: 返回 AuthenticationError 相关提示
+    """
+    logger.info(
+        f"发布评论: page_id={params.page_id}, "
+        f"format={params.content_format.value}, "
+        f"parent={params.parent_comment_id}"
+    )
+
+    try:
+        # 根据内容格式转换为 Storage Format
+        if params.content_format == ContentFormat.MARKDOWN:
+            body_storage, _ = await md_to_storage.convert(params.content)
+        else:
+            # 纯文本：按行分割，每行包裹在 <p> 标签中，转义 HTML 特殊字符
+            lines = params.content.strip().split("\n")
+            body_storage = "".join(f"<p>{html.escape(line)}</p>" for line in lines)
+
+        async with ConfluenceClient() as client:
+            result = await client.create_comment(
+                page_id=params.page_id,
+                body_storage=body_storage,
+                parent_comment_id=params.parent_comment_id,
+            )
+
+            # 提取返回信息
+            comment_id = result.get("id", "")
+            version_info = result.get("version", {})
+            author = version_info.get("by", {})
+            author_name = author.get("displayName", author.get("username", "未知"))
+
+            response = {
+                "status": "success",
+                "comment_id": comment_id,
+                "page_id": params.page_id,
+                "author": author_name,
+                "content_format": params.content_format.value,
+                "parent_comment_id": params.parent_comment_id,
+                "message": (
+                    f"评论发布成功 (ID: {comment_id})"
+                    + (f"，已回复评论 {params.parent_comment_id}" if params.parent_comment_id else "")
+                ),
+            }
+
+            logger.info(f"评论发布成功: {comment_id}")
+            return json.dumps(response, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.error(f"发布评论失败: {e}", exc_info=True)
         return _handle_error(e)
 
 

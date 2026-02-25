@@ -574,6 +574,105 @@ class ConfluenceClient:
         )
         return attachment_info
 
+    async def get_comments(
+        self,
+        page_id: str,
+        depth: str = "all",
+        start: int = 0,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """获取页面评论
+
+        Args:
+            page_id: 页面 ID
+            depth: 评论深度，'all' 获取所有嵌套回复，'' 只获取顶级评论
+            start: 分页起始索引
+            limit: 每页返回数量
+
+        Returns:
+            包含评论列表和分页信息的字典
+
+        Raises:
+            NotFoundError: 页面不存在
+            PermissionError: 无权限访问
+            APIError: 其他 API 错误
+        """
+        url = f"{self.base_url}/content/{page_id}/child/comment"
+        params: Dict[str, Any] = {
+            "expand": "body.storage,version,extensions.resolution",
+            "start": start,
+            "limit": limit,
+        }
+        if depth:
+            params["depth"] = depth
+
+        logger.info(f"获取页面评论: {page_id} (depth={depth}, start={start}, limit={limit})")
+        response = await self._request_with_retry("GET", url, params=params)
+
+        if response.status_code != 200:
+            self._handle_error(response)
+
+        data = response.json()
+        logger.info(f"获取到 {data.get('size', 0)} 条评论")
+        return data
+
+    async def create_comment(
+        self,
+        page_id: str,
+        body_storage: str,
+        parent_comment_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """创建页面评论
+
+        通过 POST /rest/api/content 创建 type=comment 的内容对象。
+
+        Args:
+            page_id: 页面 ID
+            body_storage: 评论内容（Storage Format）
+            parent_comment_id: 父评论 ID（可选，用于回复评论）
+
+        Returns:
+            创建后的评论信息字典
+
+        Raises:
+            NotFoundError: 页面不存在
+            PermissionError: 无权限添加评论
+            APIError: 其他 API 错误
+        """
+        request_body: Dict[str, Any] = {
+            "type": "comment",
+            "container": {
+                "id": page_id,
+                "type": "page",
+            },
+            "body": {
+                "storage": {
+                    "value": body_storage,
+                    "representation": "storage",
+                }
+            },
+        }
+
+        # 如果是回复评论，container 指向父评论
+        if parent_comment_id:
+            request_body["ancestors"] = [{"id": parent_comment_id}]
+
+        url = f"{self.base_url}/content"
+        logger.info(
+            f"创建评论: page_id={page_id}, parent_comment_id={parent_comment_id}"
+        )
+
+        response = await self._request_with_retry(
+            "POST", url, json=request_body
+        )
+
+        if response.status_code not in [200, 201]:
+            self._handle_error(response)
+
+        data = response.json()
+        logger.info(f"评论创建成功: ID={data.get('id')}")
+        return data
+
     async def get_attachments(
         self,
         page_id: str,
