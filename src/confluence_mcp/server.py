@@ -8,10 +8,12 @@
 """
 import json
 import os
+import re
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -182,6 +184,79 @@ class SearchPagesInput(BaseModel):
         if not v.strip():
             raise ValueError("搜索关键词不能为空")
         return v.strip()
+
+
+class UploadDrawioInput(BaseModel):
+    """上传 draw.io 图表到已有 Confluence 页面的输入参数"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    page_id: str = Field(
+        ...,
+        description="目标 Confluence 页面 ID（例如：'123456'）",
+        min_length=1,
+        max_length=50,
+    )
+    drawio_xml: str = Field(
+        ...,
+        description="Draw.io 图表的 XML 内容（完整的 mxfile 或 mxGraphModel XML 字符串）",
+        min_length=1,
+    )
+    file_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "附件文件名（可选，默认自动生成 'drawio_diagram_0.drawio'）。"
+            "必须以 .drawio ��尾"
+        ),
+        max_length=255,
+    )
+    insert_position: Optional[str] = Field(
+        default=None,
+        description=(
+            "插入位置的标题文本（可选）。"
+            "如果指定，draw.io 宏将插入到该标题之后；"
+            "如果不指定或标题未找到，将追加到页面内容末尾。"
+            "例如：'系统架构' 或 '流程设计'"
+        ),
+        max_length=500,
+    )
+
+    @field_validator("page_id")
+    @classmethod
+    def validate_page_id(cls, v: str) -> str:
+        """验证页面 ID"""
+        if not v.strip():
+            raise ValueError("page_id 不能为空")
+        return v.strip()
+
+    @field_validator("drawio_xml")
+    @classmethod
+    def validate_drawio_xml(cls, v: str) -> str:
+        """验证 draw.io XML 内容的基本格式"""
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("drawio_xml 不能为空")
+        if not (stripped.startswith("<mxfile") or stripped.startswith("<mxGraphModel")):
+            raise ValueError(
+                "drawio_xml 格式无效：应以 <mxfile 或 <mxGraphModel 开头。"
+                "请提供完整的 draw.io XML 内容。"
+            )
+        return stripped
+
+    @field_validator("file_name")
+    @classmethod
+    def validate_file_name(cls, v: Optional[str]) -> Optional[str]:
+        """验证文件名格式"""
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if not v.endswith(".drawio"):
+            raise ValueError("file_name 必须以 .drawio 结尾")
+        if any(c in v for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']):
+            raise ValueError("file_name 包含非法字符")
+        return v
 
 
 # ============== 错误处理辅助函数 ==============
@@ -729,6 +804,184 @@ async def confluence_search_pages(params: SearchPagesInput) -> str:
 
     except Exception as e:
         logger.error(f"搜索失败: {e}", exc_info=True)
+        return _handle_error(e)
+
+
+# ============== 辅助函数 ==============
+
+
+def _insert_macro_after_heading(
+    storage_content: str, heading_text: str, macro_html: str
+) -> Tuple[str, bool]:
+    """在匹配标题后插入 HTML 内容
+
+    在 Confluence Storage Format 中找到与 heading_text 匹配的标题标签（h1-h6），
+    将 macro_html 插入到该标题标签之后。
+
+    Args:
+        storage_content: Confluence Storage Format 内容
+        heading_text: 要匹配的标题文本（精确匹配，忽略首尾空白）
+        macro_html: 要插入的 draw.io 宏 HTML
+
+    Returns:
+        (修改后的内容, 是否成功找到并插入)
+    """
+    soup = BeautifulSoup(storage_content, "html.parser")
+    target_heading = None
+
+    for heading_tag in soup.find_all(re.compile(r"^h[1-6]$")):
+        if heading_tag.get_text(strip=True) == heading_text.strip():
+            target_heading = heading_tag
+            break
+
+    if target_heading is None:
+        return storage_content, False
+
+    macro_soup = BeautifulSoup(macro_html, "html.parser")
+    target_heading.insert_after(macro_soup)
+    return str(soup), True
+
+
+@mcp.tool(
+    name="confluence_upload_drawio",
+    annotations={
+        "title": "上传 Draw.io 图表到 Confluence 页面",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def confluence_upload_drawio(params: UploadDrawioInput) -> str:
+    """上传 Draw.io 图表 XML 作为附件到 Confluence 页面，并在页面内容中插入 draw.io 宏。
+
+    此工具接受 draw.io 的原始 XML 内容，将其作为 .drawio 附件上传到指定页面，
+    然后在页面内容中插入对应的 draw.io 宏来渲染该图表。
+
+    支持以下特性：
+    - 自动上传 XML 为 .drawio 附件（支持同名覆盖更新）
+    - 在指定标题位置后插入 draw.io 宏
+    - 追加到页面末尾（默认行为）
+    - 自定义附件文件名
+
+    Args:
+        params (UploadDrawioInput): 包含以下字段：
+            - page_id (str): 目标页面 ID
+            - drawio_xml (str): Draw.io XML 内容（mxfile 或 mxGraphModel 格式）
+            - file_name (Optional[str]): 附件文件名（默认自动生成，需以 .drawio 结尾）
+            - insert_position (Optional[str]): 标题文本，宏将插入到该标题下方
+
+    Returns:
+        str: JSON 格式的操作结果，包含：
+            - status: 操作状态
+            - message: 操作消息
+            - page_id: 页面 ID
+            - title: 页面标题
+            - version: 新版本号
+            - url: 页面 URL
+            - attachment_id: 附件 ID
+            - attachment_name: 附件文件名
+            - insert_position_matched: 是否找到匹配的标题位置
+
+    Examples:
+        - 追加到末尾:
+          params = {
+              "page_id": "123456",
+              "drawio_xml": "<mxfile>...</mxfile>"
+          }
+        - 指定位置和文件名:
+          params = {
+              "page_id": "123456",
+              "drawio_xml": "<mxfile>...</mxfile>",
+              "file_name": "architecture.drawio",
+              "insert_position": "系统架构"
+          }
+
+    Error Handling:
+        - 页面不存在: 返回 NotFoundError 相关提示
+        - 权限不足: 返回 PermissionError 相关提示
+        - 认证失败: 返回 AuthenticationError 相关提示
+    """
+    logger.info(
+        f"上传 draw.io 图表到页面: {params.page_id} "
+        f"(file_name={params.file_name}, insert_position={params.insert_position})"
+    )
+
+    try:
+        async with ConfluenceClient() as client:
+            # Step 1: 获取当前页面信息
+            page = await client.get_page(params.page_id)
+            storage_content = page.storage_content
+            version_number = page.version.number if page.version else 1
+
+            # Step 2: 确定文件名
+            file_name = params.file_name or DrawioHandler.generate_attachment_filename(0)
+
+            # Step 3: 上传 draw.io XML 为附件
+            attachment_info = await client.upload_attachment_bytes(
+                page_id=params.page_id,
+                content=params.drawio_xml.encode("utf-8"),
+                file_name=file_name,
+                content_type="application/vnd.jgraph.mxfile",
+                comment="Draw.io diagram uploaded via MCP",
+            )
+            logger.info(f"draw.io 附件上传成功: {file_name}")
+
+            # Step 4: 生成 draw.io 宏
+            macro_html = DrawioHandler.markdown_to_drawio_macro(file_name)
+
+            # Step 5: 将宏插入页面内容
+            insert_position_matched = False
+            if params.insert_position:
+                storage_content, insert_position_matched = _insert_macro_after_heading(
+                    storage_content, params.insert_position, macro_html
+                )
+                if not insert_position_matched:
+                    logger.warning(
+                        f"未找到匹配标题 '{params.insert_position}'，将追加到页面末尾"
+                    )
+                    storage_content += macro_html
+            else:
+                storage_content += macro_html
+
+            # Step 6: 更新页面
+            updated_page = await client.update_page(
+                page_id=params.page_id,
+                title=page.title,
+                body_storage=storage_content,
+                version_number=version_number,
+            )
+
+            # Step 7: 返回结果
+            result = {
+                "status": "success",
+                "message": f"Draw.io 图表上传成功: {file_name}",
+                "page_id": updated_page.id,
+                "title": updated_page.title,
+                "space": updated_page.space.key,
+                "version": (
+                    updated_page.version.number if updated_page.version else 1
+                ),
+                "url": (
+                    f"{config.confluence_base_url}{updated_page.web_url}"
+                    if updated_page.web_url
+                    else None
+                ),
+                "attachment_id": attachment_info.get("id"),
+                "attachment_name": file_name,
+                "insert_position_matched": insert_position_matched,
+            }
+
+            if params.insert_position and not insert_position_matched:
+                result["message"] += (
+                    f"（注意：未找到标题 '{params.insert_position}'，已追加到页面末尾）"
+                )
+
+            logger.info(f"draw.io 图表上传完成: {params.page_id}")
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.error(f"上传 draw.io 图表失败: {e}", exc_info=True)
         return _handle_error(e)
 
 

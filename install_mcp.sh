@@ -171,7 +171,7 @@ check_python_venv() {
                 ;;
             *)
                 print_install_guide "安装 venv 模块" \
-                    "请确保你的 Python 安装��含 venv 模块" \
+                    "请确保你的 Python 安装包含 venv 模块" \
                     "通常重新安装完整版 Python 即可解决"
                 ;;
         esac
@@ -219,6 +219,73 @@ check_git() {
         fail "请安装 Git 后重新运行此脚本"
     fi
     ok "Git: $(git --version | head -1)"
+}
+
+check_disk_and_permissions() {
+    # 检查磁盘空间（至少需要 500MB）
+    local available_mb
+    if command -v df &>/dev/null; then
+        available_mb=$(df -m "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' || echo "")
+        if [ -n "$available_mb" ] && [ "$available_mb" -lt 500 ] 2>/dev/null; then
+            warn "磁盘剩余空间不足 (${available_mb}MB)，建议至少 500MB"
+            print_install_guide "释放磁盘空间" \
+                "当前可用：${available_mb}MB" \
+                "安装约需：~300MB（Python 虚拟环境 + 依赖包）" \
+                "" \
+                "查看磁盘使用：${CYAN}df -h $HOME${NC}" \
+                "查找大文件：${CYAN}du -sh $HOME/* | sort -rh | head -10${NC}"
+            read -rp "是否继续安装？[y/N]: " cont
+            if [[ ! "$cont" =~ ^[Yy] ]]; then
+                info "已取消"
+                exit 0
+            fi
+        else
+            ok "磁盘空间充足 (${available_mb:-未知}MB 可用)"
+        fi
+    fi
+
+    # 检查 HOME 目录写权限
+    if [ ! -w "$HOME" ]; then
+        fail "无法写入主目录 $HOME，请检查目录权限"
+    fi
+
+    # 检查 .local/share 是否可写（或可创建）
+    local parent_dir="$HOME/.local/share"
+    if [ -d "$parent_dir" ] && [ ! -w "$parent_dir" ]; then
+        fail "无法写入 $parent_dir，请执行：${CYAN}chmod u+w $parent_dir${NC}"
+    fi
+    ok "目录权限正常"
+}
+
+check_existing_install() {
+    if [ -d "$VENV_DIR" ]; then
+        warn "检测到已有安装：$INSTALL_DIR"
+        echo ""
+        echo "  选择操作："
+        echo "    1) 覆盖安装（重新创建虚拟环境）"
+        echo "    2) 保留环境，仅更新配置"
+        echo "    3) 取消"
+        echo ""
+        read -rp "请选择 [1/2/3]: " choice
+        case "${choice:-1}" in
+            1)
+                info "将删除旧安装目录并重新安装"
+                rm -rf "$INSTALL_DIR"
+                ;;
+            2)
+                SKIP_INSTALL=true
+                info "将跳过安装步骤，仅更新 Confluence 配置"
+                ;;
+            3)
+                info "已取消"
+                exit 0
+                ;;
+            *)
+                info "无效选择，默认覆盖安装"
+                rm -rf "$INSTALL_DIR"
+                ;;
+        esac
+    fi
 }
 
 check_claude_code() {
@@ -321,7 +388,9 @@ test_confluence_connection() {
         -H "Authorization: Bearer $CONFLUENCE_API_TOKEN" \
         --connect-timeout 10 \
         --max-time 15 \
-        "$CONFLUENCE_BASE_URL/rest/api/space?limit=1" 2>/dev/null || echo "000")
+        "$CONFLUENCE_BASE_URL/rest/api/space?limit=1" 2>/dev/null) || true
+    # curl 无法连接时会输出 000 并返回非零退出码
+    http_code="${http_code:-000}"
 
     case "$http_code" in
         200)
@@ -398,7 +467,7 @@ install_project() {
     # 判断是否在项目目录内运行
     if [ -f "./pyproject.toml" ] && grep -q 'name = "confluence-mcp"' ./pyproject.toml 2>/dev/null; then
         info "检测到当前目录为项目源码，使用 editable 模式安装"
-        if ! "$pip_cmd" install -e "$(pwd)" 2>/tmp/pip_error.log; then
+        if ! "$pip_cmd" install -e "$(pwd)" -q 2>/tmp/pip_error.log; then
             local err
             err=$(tail -5 /tmp/pip_error.log 2>/dev/null || echo "未知错误")
             warn "pip install 失败"
@@ -435,7 +504,7 @@ install_project() {
         rm -f /tmp/git_error.log
 
         info "安装依赖（首次可能较慢）..."
-        if ! "$pip_cmd" install "$CLONE_DIR" 2>/tmp/pip_error.log; then
+        if ! "$pip_cmd" install "$CLONE_DIR" -q 2>/tmp/pip_error.log; then
             local err
             err=$(tail -5 /tmp/pip_error.log 2>/dev/null || echo "未知错误")
             warn "依赖安装失败"
@@ -467,36 +536,21 @@ register_mcp() {
 
     local venv_python="$VENV_DIR/bin/python"
 
-    # 构建 env JSON
-    local env_json
-    env_json=$(cat <<ENDJSON
-{
-    "CONFLUENCE_BASE_URL": "$CONFLUENCE_BASE_URL",
-    "CONFLUENCE_API_TOKEN": "$CONFLUENCE_API_TOKEN",
-    "CONFLUENCE_DEFAULT_SPACE": "${CONFLUENCE_DEFAULT_SPACE:-}",
-    "LOG_LEVEL": "INFO"
-}
-ENDJSON
-)
-
-    # 构建 MCP server 配置
-    local server_config
-    server_config=$(cat <<ENDJSON
-{
-    "type": "stdio",
-    "command": "$venv_python",
-    "args": ["-m", "confluence_mcp.server"],
-    "env": $env_json
-}
-ENDJSON
-)
-
-    # 更新 ~/.claude.json
-    if ! "$venv_python" -c "
+    # 使用 Python 安全构建 JSON 并写入配置（避免 Token 中特殊字符导致 JSON 注入）
+    if ! _INSTALL_BASE_URL="$CONFLUENCE_BASE_URL" \
+         _INSTALL_API_TOKEN="$CONFLUENCE_API_TOKEN" \
+         _INSTALL_DEFAULT_SPACE="${CONFLUENCE_DEFAULT_SPACE:-}" \
+         "$venv_python" -c "
 import json, sys, os
 
 config_path = os.path.expanduser('$CLAUDE_CONFIG')
 server_name = '$MCP_SERVER_NAME'
+venv_python = '$venv_python'
+
+# 从环境变量读取敏感值（避免命令行中暴露）
+base_url = os.environ['_INSTALL_BASE_URL']
+api_token = os.environ['_INSTALL_API_TOKEN']
+default_space = os.environ.get('_INSTALL_DEFAULT_SPACE', '')
 
 # 读取或初始化配置
 if os.path.exists(config_path):
@@ -517,8 +571,17 @@ if 'servers' in config['mcpServers']:
         del config['mcpServers']['servers']
 
 # 写入正确位置: mcpServers.confluence
-server_config = json.loads('''$server_config''')
-config['mcpServers'][server_name] = server_config
+config['mcpServers'][server_name] = {
+    'type': 'stdio',
+    'command': venv_python,
+    'args': ['-m', 'confluence_mcp.server'],
+    'env': {
+        'CONFLUENCE_BASE_URL': base_url,
+        'CONFLUENCE_API_TOKEN': api_token,
+        'CONFLUENCE_DEFAULT_SPACE': default_space,
+        'LOG_LEVEL': 'INFO'
+    }
+}
 
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
@@ -558,8 +621,8 @@ verify_install() {
 
     local venv_python="$VENV_DIR/bin/python"
 
-    # 验证模块可导入
-    if ! "$venv_python" -c "from confluence_mcp.server import mcp; print('module ok')" 2>/dev/null; then
+    # 验证模块可导入（仅检查包安装，不触发配置加载）
+    if ! "$venv_python" -c "import confluence_mcp; print('module ok')" 2>/dev/null; then
         warn "模块导入失败"
         print_install_guide "排查建议" \
             "1. 尝试重新安装：${CYAN}bash $0${NC}" \
@@ -773,32 +836,42 @@ main() {
     echo ""
 
     # Step 1: 前置检查
-    step "Step 1/6: 环境检查"
+    step "Step 1/7: 环境检查"
     check_python
     check_python_venv
     check_git
+    check_disk_and_permissions
     check_claude_code
+    SKIP_INSTALL=false
+    check_existing_install
 
     # Step 2: 收集配置
-    step "Step 2/6: Confluence 配置"
+    step "Step 2/7: Confluence 配置"
     collect_config
 
     # Step 3: 验证连通性
-    step "Step 3/6: 连通性测试"
+    step "Step 3/7: 连通性测试"
     test_confluence_connection
 
     # Step 4: 安装
-    step "Step 4/6: 安装项目"
-    install_project
+    step "Step 4/7: 安装项目"
+    if [ "$SKIP_INSTALL" = true ]; then
+        info "跳过安装步骤（保留现有环境）"
+    else
+        install_project
+    fi
 
     # Step 5: 注册 MCP
-    step "Step 5/6: 注册服务"
+    step "Step 5/7: 注册服务"
     register_mcp
 
     # Step 6: 验证 + 可选组件
-    step "Step 6/6: 验证安装"
+    step "Step 6/7: 验证安装"
     verify_install
     echo ""
+
+    # Step 7: 可选组件
+    step "Step 7/7: 可选组件"
     check_mermaid
 
     # 完成
